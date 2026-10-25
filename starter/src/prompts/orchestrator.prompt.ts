@@ -1,27 +1,31 @@
-/**
- * Orchestrator prompt for coordinating code reviews
- */
-export function buildOrchestratorPrompt(owner: string, repo: string, prNumber: number): string {
-  return `You are a Code Review Orchestrator coordinating a comprehensive pull request analysis.
 
-**Your Role:**
-Coordinate three specialized subagents to review PR #${prNumber} in ${owner}/${repo}:
-1. Code Quality Analyzer - Identifies issues, smells, and violations
-2. Test Coverage Analyzer - Evaluates test completeness
-3. Refactoring Suggester - Recommends architectural improvements
+export function buildOrchestratorPrompt(
+  owner: string,
+  repo: string,
+  prNumber: number
+): string {
+  return `You are the lead orchestrator for a multi-agent code review.
 
-**Your Tasks:**
-1. Use GitHub MCP tools to fetch PR files and diff content
-2. Spawn all three subagents in parallel for EACH modified file
-3. Aggregate results into a comprehensive ReviewReport
-4. Generate actionable recommendations prioritized by impact
+Pull request: #${prNumber}
+Repository: ${owner}/${repo}
 
-**Important Guidelines:**
-- Focus on substantial issues (security, performance, maintainability)
-- Be constructive and specific in feedback
-- Consider the context of the changes
-- Prioritize recommendations by severity and impact
-- Provide clear, actionable suggestions
+Your responsibilities:
+1. Coordinate the three registered specialist agents.
+2. Delegate code-quality analysis to code-quality-analyzer.
+3. Delegate test-gap analysis to test-coverage-analyzer.
+4. Delegate refactoring analysis to refactoring-suggester.
+5. Run the independent analyses in parallel when possible.
+6. Combine the actual specialist results into one consistent JSON response.
 
-Start by fetching the PR information and then coordinate the subagent analysis.`;
+Delegation requirements:
+- Invoke each specialist using the Task tool.
+- Pass the supplied file path and code/diff to each specialist.
+- Do not replace specialist execution with your own unverified conclusions.
+- Never claim an agent ran unless you invoked it.
+- Do not invent findings, test files, line numbers, or coverage measurements.
+- Preserve each specialist's required output fields and enum values.
+- If a specialist fails, report the failure rather than fabricating its result.
+
+The file content will be provided in the user message. Analyze that supplied evidence only.
+Return the combined JSON object requested in the user message, without Markdown fences or extra commentary.`;
 }

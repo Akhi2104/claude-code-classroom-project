@@ -15,6 +15,8 @@ import {
   testCoverageAnalyzer,
   refactoringSuggester
 } from './agents';
+import { buildOrchestratorPrompt } from './prompts';
+import { mcpServersConfig } from './config/mcp.config';
 import {
   RateLimiter,
   RateLimiterConfig,
@@ -29,12 +31,33 @@ import {
   logAgentComplete
 } from './utils/logger';
 
+interface ChangedFile {
+  filename: string;
+  status: string;
+  patch?: string;
+  additions?: number;
+  deletions?: number;
+}
+
+interface FileAnalysis {
+  file: string;
+  codeQuality: CodeQualityResult;
+  testCoverage: TestCoverageResult;
+  refactorings: RefactoringSuggestion;
+}
+
+interface RawFileAnalysis {
+  codeQuality: unknown;
+  testCoverage: unknown;
+  refactorings: unknown;
+}
+
 export interface OrchestratorOptions {
   rateLimits?: Partial<RateLimiterConfig>;
 }
 
 export class CodeReviewOrchestrator {
-  private rateLimiter: RateLimiter;
+  private readonly rateLimiter: RateLimiter;
 
   constructor(options: OrchestratorOptions = {}) {
     this.rateLimiter = new RateLimiter(
@@ -47,70 +70,78 @@ export class CodeReviewOrchestrator {
     repo: string,
     prNumber: number
   ): Promise<ReviewReport> {
-    if (!owner.trim() || !repo.trim() || !Number.isInteger(prNumber) || prNumber <= 0) {
-      throw new Error('A valid repository owner, repository name, and PR number are required.');
+    if (
+      !owner.trim() ||
+      !repo.trim() ||
+      !Number.isInteger(prNumber) ||
+      prNumber <= 0
+    ) {
+      throw new Error(
+        'A valid repository owner, repository name, and PR number are required.'
+      );
     }
 
     const startTime = Date.now();
     logReviewStart(owner, repo, prNumber);
 
-    // Fetch PR metadata and changed files directly from GitHub REST API. This avoids
-    // requiring Claude to request interactive permission for GitHub MCP tools.
-    const { files: changedFiles, headSha } = await this.fetchPullRequestFiles(owner, repo, prNumber);
-    const selectedFiles = changedFiles.filter((item) => !this.shouldSkipFile(item.filename)).slice(0, 10);
+    const { files: changedFiles, headSha } =
+      await this.fetchPullRequestFiles(owner, repo, prNumber);
+
+    const selectedFiles = changedFiles
+      .filter((file) => !this.shouldSkipFile(file.filename))
+      .slice(0, 10);
 
     if (selectedFiles.length === 0) {
-      throw new Error(`No reviewable changed files found for ${owner}/${repo} PR #${prNumber}.`);
+      throw new Error(
+        `No reviewable changed files found for ${owner}/${repo} PR #${prNumber}.`
+      );
     }
 
-    logger.info(`Retrieved ${changedFiles.length} changed files from PR #${prNumber}; reviewing ${selectedFiles.length}`);
+    logger.info(
+      `Retrieved ${changedFiles.length} changed files; reviewing ${selectedFiles.length}`
+    );
 
+    // Each file gets one orchestration query. The orchestrator must delegate
+    // the three specialized analyses through Task subagents.
     const results = await Promise.allSettled(
-      selectedFiles.map(async (changedFile) => {
+      selectedFiles.map(async (changedFile): Promise<FileAnalysis> => {
         const file = changedFile.filename;
-        const fileContent = await this.fetchFileReviewContent(owner, repo, headSha, changedFile);
-        if (!fileContent.trim()) {
-          throw new Error(`GitHub returned no code or diff for ${file}`);
+        const content = await this.fetchFileReviewContent(
+          owner,
+          repo,
+          headSha,
+          changedFile
+        );
+
+        if (!content.trim()) {
+          throw new Error(`No code or diff available for ${file}`);
         }
 
-        const [codeQuality, testCoverage, refactorings] = await Promise.all([
-          this.analyzeCodeQuality(file, fileContent),
-          this.analyzeTestCoverage(file, fileContent),
-          this.suggestRefactorings(file, fileContent)
-        ]);
-
-        return { file, codeQuality, testCoverage, refactorings };
+        return this.analyzeFile(owner, repo, prNumber, file, content);
       })
     );
 
-    const fileReviews = results
-      .filter(
-        (result): result is PromiseFulfilledResult<{
-          file: string;
-          codeQuality: CodeQualityResult;
-          testCoverage: TestCoverageResult;
-          refactorings: RefactoringSuggestion;
-        }> => result.status === 'fulfilled'
-      )
-      .map((result) => result.value);
+    const fileReviews: FileAnalysis[] = [];
+    let failedFiles = 0;
 
-    const failedFiles = results
-      .filter(
-        (result): result is PromiseRejectedResult => result.status === 'rejected'
-      );
-
-    for (const failure of failedFiles) {
-      logger.error('File review failed', {
-        error: failure.reason instanceof Error
-          ? failure.reason.message
-          : String(failure.reason)
-      });
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        fileReviews.push(result.value);
+      } else {
+        failedFiles++;
+        logger.error('File review failed', {
+          error:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason)
+        });
+      }
     }
 
     if (fileReviews.length === 0) {
       throw new Error(
         `No files were successfully reviewed for ${owner}/${repo} PR #${prNumber}. ` +
-        `${failedFiles.length} file review(s) failed. Check the logs; no empty report was generated.`
+        `${failedFiles} file review(s) failed. Check the logs.`
       );
     }
 
@@ -124,15 +155,18 @@ export class CodeReviewOrchestrator {
       ),
       criticalIssues: fileReviews.reduce(
         (sum, review) =>
-          sum + review.codeQuality.issues.filter(
+          sum +
+          review.codeQuality.issues.filter(
             (issue) => issue.severity === 'critical'
           ).length,
         0
       ),
       highPriorityTests: fileReviews.reduce(
         (sum, review) =>
-          sum + review.testCoverage.untestedPaths.filter(
-            (path) => path.priority === 'critical' || path.priority === 'high'
+          sum +
+          review.testCoverage.untestedPaths.filter(
+            (path) =>
+              path.priority === 'critical' || path.priority === 'high'
           ).length,
         0
       ),
@@ -142,10 +176,16 @@ export class CodeReviewOrchestrator {
       )
     };
 
-    const recommendations = this.generateRecommendations(fileReviews);
     const duration = Date.now() - startTime;
+    const recommendations = this.generateRecommendations(fileReviews);
 
-    logReviewComplete(owner, repo, prNumber, summary.overallScore, duration);
+    logReviewComplete(
+      owner,
+      repo,
+      prNumber,
+      summary.overallScore,
+      duration
+    );
 
     const report: ReviewReport = {
       pullRequest: { owner, repo, number: prNumber },
@@ -156,10 +196,10 @@ export class CodeReviewOrchestrator {
         analyzedAt: new Date().toISOString(),
         duration,
         agentVersions: {
-          orchestrator: '1.1.0',
-          codeQuality: '1.1.0',
-          testCoverage: '1.1.0',
-          refactoring: '1.1.0'
+          orchestrator: '1.2.0',
+          codeQuality: '1.2.0',
+          testCoverage: '1.2.0',
+          refactoring: '1.2.0'
         }
       }
     };
@@ -167,8 +207,177 @@ export class CodeReviewOrchestrator {
     return ReviewReportSchema.parse(report);
   }
 
+  private async analyzeFile(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    file: string,
+    content: string
+  ): Promise<FileAnalysis> {
+    logAgentStart('orchestrator', file);
+    const startTime = Date.now();
+
+    const result = await withRetry(async () => {
+      await this.rateLimiter.acquire(5000);
+
+      try {
+        return await withTimeout(
+          () => this.sendQuery(owner, repo, prNumber, file, content),
+          180000,
+          `Multi-agent analysis timed out for ${file}`
+        );
+      } finally {
+        this.rateLimiter.release(5000);
+      }
+    });
+
+    const parsed = this.extractJson(result) as RawFileAnalysis;
+
+    const codeQuality = CodeQualityResultSchema.parse({
+      ...(parsed.codeQuality as Record<string, unknown>),
+      file
+    });
+
+    const testCoverage = TestCoverageResultSchema.parse({
+      ...(parsed.testCoverage as Record<string, unknown>),
+      file
+    });
+
+    const refactorings = RefactoringSuggestionSchema.parse({
+      ...(parsed.refactorings as Record<string, unknown>),
+      file
+    });
+
+    logAgentComplete('orchestrator', file, Date.now() - startTime);
+
+    return { file, codeQuality, testCoverage, refactorings };
+  }
+
+  private async sendQuery(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    file: string,
+    content: string
+  ): Promise<string> {
+    const basePrompt = buildOrchestratorPrompt(owner, repo, prNumber);
+
+    const prompt = `${basePrompt}
+
+## Current file to review
+
+The pull request metadata and changed-file content have already been retrieved.
+Review ONLY the supplied file content below. Do not fetch the PR again.
+
+File: ${file}
+
+<file_review_input>
+${content.slice(0, 18000)}
+</file_review_input>
+
+## Required delegation
+
+You MUST invoke each of these three registered subagents using the Task tool:
+1. code-quality-analyzer
+2. test-coverage-analyzer
+3. refactoring-suggester
+
+Give each subagent the file path and relevant supplied code/diff. Run the three independent analyses in parallel when possible. Do not fabricate a subagent result or claim an agent ran unless you actually invoked it.
+
+Combine their results into one JSON object with exactly these top-level keys:
+{
+  "codeQuality": {
+    "file": "${file}",
+    "issues": [],
+    "overallScore": 85,
+    "summary": "Evidence-based summary"
+  },
+  "testCoverage": {
+    "file": "${file}",
+    "hasTests": false,
+    "testFiles": [],
+    "untestedPaths": [],
+    "coverageEstimate": 0,
+    "summary": "Evidence and limitations"
+  },
+  "refactorings": {
+    "file": "${file}",
+    "suggestions": [],
+    "summary": "Evidence-based summary"
+  }
+}
+
+Every nested result must follow its specialist's required schema. Do not add Markdown fences, comments, or text outside the JSON object.`;
+
+    const q = query({
+      prompt,
+      options: {
+        model:
+          process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5-20250929',
+        cwd: process.cwd(),
+        settingSources: ['project'],
+        tools: { type: 'preset', preset: 'claude_code' },
+        allowedTools: [
+          'Task',
+          'Skill',
+          'Read',
+          'Grep',
+          'Glob',
+          'mcp__github__*',
+          'mcp__eslint__*'
+        ],
+        permissionMode: 'dontAsk',
+        mcpServers: {
+          github: mcpServersConfig.github,
+          eslint: mcpServersConfig.eslint
+        },
+        agents: {
+          'code-quality-analyzer': codeQualityAnalyzer,
+          'test-coverage-analyzer': testCoverageAnalyzer,
+          'refactoring-suggester': refactoringSuggester
+        },
+        maxTurns: 20
+      }
+    });
+
+    let finalResult = '';
+    let hadError = false;
+
+    for await (const message of q) {
+      if (message.type === 'result') {
+        if (message.is_error) {
+          hadError = true;
+          logger.error('Claude Agent SDK execution failed', {
+            subtype: message.subtype,
+            detail:
+              'errors' in message
+                ? message.errors
+                : 'result' in message
+                  ? message.result
+                  : 'Unknown SDK error'
+          });
+        } else if ('result' in message) {
+          finalResult = message.result;
+        }
+      }
+    }
+
+    if (hadError) {
+      throw new Error(`Claude Agent SDK failed while reviewing ${file}`);
+    }
+
+    if (!finalResult.trim()) {
+      throw new Error(
+        `Claude Agent SDK returned no final result for ${file}`
+      );
+    }
+
+    return finalResult;
+  }
+
   private async githubRequest<T>(url: string): Promise<T> {
     const token = process.env.GITHUB_TOKEN;
+
     const response = await fetch(url, {
       headers: {
         Accept: 'application/vnd.github+json',
@@ -180,102 +389,99 @@ export class CodeReviewOrchestrator {
 
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 400);
-      throw new Error(`GitHub API request failed (${response.status}) for ${url}: ${detail}`);
+      throw new Error(
+        `GitHub API request failed (${response.status}): ${detail}`
+      );
     }
+
     return response.json() as Promise<T>;
   }
 
-  private async fetchPullRequestFiles(owner: string, repo: string, prNumber: number): Promise<{
-    headSha: string;
-    files: Array<{ filename: string; status: string; patch?: string; additions?: number; deletions?: number }>;
-  }> {
-    const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${prNumber}`;
+  private async fetchPullRequestFiles(
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<{ headSha: string; files: ChangedFile[] }> {
+    const base =
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/` +
+      `${encodeURIComponent(repo)}/pulls/${prNumber}`;
+
     const pr = await this.githubRequest<{ head: { sha: string } }>(base);
-    const files = await this.githubRequest<Array<{ filename: string; status: string; patch?: string; additions?: number; deletions?: number }>>(`${base}/files?per_page=100`);
-    if (!Array.isArray(files)) throw new Error('GitHub API returned an invalid pull-request files response.');
+
+    const files = await this.githubRequest<ChangedFile[]>(
+      `${base}/files?per_page=100`
+    );
+
+    if (!Array.isArray(files)) {
+      throw new Error(
+        'GitHub API returned an invalid pull-request files response.'
+      );
+    }
+
     return { headSha: pr.head.sha, files };
   }
 
   private shouldSkipFile(filename: string): boolean {
-    return /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock)$/i.test(filename) ||
-      /\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|woff2?|ttf|map)$/i.test(filename) ||
-      /(^|\/)(dist|build|coverage|node_modules)\//i.test(filename);
+    return (
+      /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock)$/i.test(
+        filename
+      ) ||
+      /\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|woff2?|ttf|map)$/i.test(
+        filename
+      ) ||
+      /(^|\/)(dist|build|coverage|node_modules)\//i.test(filename)
+    );
   }
 
   private async fetchFileReviewContent(
     owner: string,
     repo: string,
     headSha: string,
-    file: { filename: string; status: string; patch?: string; additions?: number; deletions?: number }
+    file: ChangedFile
   ): Promise<string> {
-    const patch = file.patch ? `PATCH / DIFF:\n${file.patch}` : 'Patch unavailable from GitHub API.';
+    const patch = file.patch
+      ? `PATCH / DIFF:\n${file.patch}`
+      : 'Patch unavailable from GitHub API.';
+
     let source = '';
 
     if (file.status !== 'removed') {
-      const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${headSha}/${file.filename.split('/').map(encodeURIComponent).join('/')}`;
+      const rawUrl =
+        `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/` +
+        `${encodeURIComponent(repo)}/${headSha}/` +
+        file.filename.split('/').map(encodeURIComponent).join('/');
+
       try {
         const token = process.env.GITHUB_TOKEN;
         const response = await fetch(rawUrl, {
-          headers: token ? { Authorization: `Bearer ${token}`, 'User-Agent': 'claude-multiagent-code-review' } : { 'User-Agent': 'claude-multiagent-code-review' }
+          headers: {
+            'User-Agent': 'claude-multiagent-code-review',
+            ...(token ? { Authorization: `Bearer ${token}` } : {})
+          }
         });
-        if (response.ok) source = (await response.text()).slice(0, 20000);
+
+        if (response.ok) {
+          source = (await response.text()).slice(0, 20000);
+        }
       } catch (error) {
-        logger.warn('Could not fetch full file content; reviewing available diff', {
+        logger.warn('Could not fetch full source; using available diff', {
           file: file.filename,
           error: error instanceof Error ? error.message : String(error)
         });
       }
     }
 
-    return `File: ${file.filename}\nStatus: ${file.status}\nAdditions: ${file.additions ?? 'unknown'}\nDeletions: ${file.deletions ?? 'unknown'}\n\n${patch}\n\nFULL FILE CONTENT AT PR HEAD (when available):\n${source || '[Full file content unavailable; use the actual diff above.]'}`;
-  }
-
-  private parseFilePaths(response: string): string[] {
-    const cleaned = response
-      .replace(/```(?:json)?/gi, '')
-      .replace(/```/g, '')
-      .trim();
-
-    // Prefer a complete JSON array.
-    const start = cleaned.indexOf('[');
-    const end = cleaned.lastIndexOf(']');
-
-    if (start !== -1 && end > start) {
-      try {
-        const parsed: unknown = JSON.parse(cleaned.slice(start, end + 1));
-
-        if (
-          Array.isArray(parsed) &&
-          parsed.every((item) => typeof item === 'string')
-        ) {
-          return [...new Set(
-            parsed
-              .map((item: string) => item.trim())
-              .filter((item: string) =>
-                item.length > 0 &&
-                !item.startsWith('/') &&
-                !item.split('/').includes('..')
-              )
-          )];
-        }
-      } catch {
-        // Fall through to the conservative quoted-path extraction below.
-      }
-    }
-
-    const matches = cleaned.matchAll(
-      /["']([^"' \n]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|java|go|rb|php|cs|vue|svelte))["']/gi
-    );
-
-    return [...new Set(
-      Array.from(matches, (match) => match[1])
-        .filter((file): file is string =>
-          file !== undefined &&
-          file.length > 0 &&
-          !file.startsWith('/') &&
-          !file.split('/').includes('..')
-        )
-    )];
+    return [
+      `File: ${file.filename}`,
+      `Status: ${file.status}`,
+      `Additions: ${file.additions ?? 'unknown'}`,
+      `Deletions: ${file.deletions ?? 'unknown'}`,
+      '',
+      patch,
+      '',
+      'FULL FILE CONTENT AT PR HEAD (when available):',
+      source || '[Full file unavailable; use the diff above.]'
+    ].join('\n');
   }
 
   private extractJson(response: string): unknown {
@@ -290,272 +496,19 @@ export class CodeReviewOrchestrator {
       const start = cleaned.indexOf('{');
       const end = cleaned.lastIndexOf('}');
 
-      if (start === -1 || end <= start) {
-        throw new Error('Agent response did not contain a valid JSON object');
+      if (start < 0 || end <= start) {
+        throw new Error(
+          'Orchestrator response did not contain a valid JSON object.'
+        );
       }
 
       return JSON.parse(cleaned.slice(start, end + 1));
     }
   }
 
-  private async sendQuery(prompt: string): Promise<string> {
-    const q = query({
-      prompt,
-      options: {
-        model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5-20250929',
-        // This analysis needs no external tools; disabling tools prevents permission prompts.
-        tools: [],
-        permissionMode: 'dontAsk',
-        agents: {
-          'code-quality-analyzer': codeQualityAnalyzer,
-          'test-coverage-analyzer': testCoverageAnalyzer,
-          'refactoring-suggester': refactoringSuggester
-        }
-      }
-    });
-
-    const assistantTexts: string[] = [];
-    let finalResultText = '';
-    let messageCount = 0;
-    const messageTypes: string[] = [];
-
-    for await (const msg of q) {
-      messageCount++;
-      const record = msg as unknown as Record<string, unknown>;
-      const type = typeof record.type === 'string' ? record.type : 'unknown';
-      messageTypes.push(type);
-
-      // Assistant messages contain text blocks in message.content.
-      const message = record.message;
-      if (typeof message === 'object' && message !== null) {
-        const content = (message as Record<string, unknown>).content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (typeof block === 'object' && block !== null) {
-              const item = block as Record<string, unknown>;
-              if (item.type === 'text' && typeof item.text === 'string') {
-                assistantTexts.push(item.text);
-              }
-            }
-          }
-        }
-      }
-
-      // The SDK's final result event may carry the final text separately.
-      if (type === 'result' && typeof record.result === 'string') {
-        finalResultText = record.result;
-      }
-
-      // Preserve useful diagnostics for SDK errors without logging credentials.
-      if (type === 'result' && record.is_error === true) {
-        const detail = typeof record.result === 'string'
-          ? record.result
-          : typeof record.subtype === 'string'
-            ? record.subtype
-            : 'Unknown Claude Agent SDK error';
-        logger.error('Claude Agent SDK returned an error result', { detail });
-      }
-    }
-
-    const assistantResponse = assistantTexts.join('\n').trim();
-    const response = assistantResponse || finalResultText.trim();
-
-    logger.info('Query completed', {
-      totalMessages: messageCount,
-      messageTypes: [...new Set(messageTypes)],
-      textMessages: assistantTexts.length,
-      resultTextAvailable: Boolean(finalResultText.trim()),
-      totalLength: response.length
-    });
-
-    if (!response) {
-      throw new Error(
-        `Claude Agent SDK returned no text (message types: ${[...new Set(messageTypes)].join(', ') || 'none'}). ` +
-        'Check the SDK result event and model/agent errors in the logs.'
-      );
-    }
-
-    return response;
-  }
-
-  private async analyzeCodeQuality(
-    file: string,
-    content: string
-  ): Promise<CodeQualityResult> {
-    logAgentStart('code-quality-analyzer', file);
-    const startTime = Date.now();
-
-    const result = await withRetry(async () => {
-      await this.rateLimiter.acquire(5000);
-      try {
-        return await withTimeout(
-          () => this.sendQuery(
-            `You are acting as the code-quality-analyzer. Analyze the actual code and diff below.
-
-Return valid JSON matching this schema:
-{
-  "file": "string",
-  "issues": [{
-    "line": 1,
-    "severity": "critical|high|medium|low|info",
-    "category": "security|performance|maintainability|style|bug-risk|best-practice",
-    "description": "Evidence-based finding",
-    "suggestion": "Actionable fix"
-  }],
-  "overallScore": 85,
-  "summary": "Evidence-based summary"
-}
-
-Use an empty issues array when no actionable issues are found. Never invent findings or line numbers.
-
-File: ${file}
-
-${content.substring(0, 10000)}`,
-          ),
-          120000,
-          'Code quality analysis timed out'
-        );
-      } finally {
-        this.rateLimiter.release(5000);
-      }
-    });
-
-    logAgentComplete('code-quality-analyzer', file, Date.now() - startTime);
-    return this.parseCodeQualityResult(file, result);
-  }
-
-  private async analyzeTestCoverage(
-    file: string,
-    content: string
-  ): Promise<TestCoverageResult> {
-    logAgentStart('test-coverage-analyzer', file);
-    const startTime = Date.now();
-
-    const result = await withRetry(async () => {
-      await this.rateLimiter.acquire(5000);
-      try {
-        return await withTimeout(
-          () => this.sendQuery(
-            `You are acting as the test-coverage-analyzer. Analyze test coverage gaps for the code below. Do not claim measured coverage unless coverage data is supplied.
-
-Return valid JSON matching this schema:
-{
-  "file": "string",
-  "hasTests": false,
-  "testFiles": [],
-  "untestedPaths": [{
-    "type": "function|class|branch|edge-case",
-    "location": "Known function or location",
-    "priority": "critical|high|medium|low",
-    "reasoning": "Why this path needs a test",
-    "suggestedTest": "Specific test scenario"
-  }],
-  "coverageEstimate": 0,
-  "summary": "Explain what evidence was available"
-}
-
-Use only test files actually identified. Use 0 for coverageEstimate when no measured coverage is available and explain that it is not a measured percentage.
-
-File: ${file}
-
-${content.substring(0, 10000)}`,
-          ),
-          120000,
-          'Test coverage analysis timed out'
-        );
-      } finally {
-        this.rateLimiter.release(5000);
-      }
-    });
-
-    logAgentComplete('test-coverage-analyzer', file, Date.now() - startTime);
-    return this.parseTestCoverageResult(file, result);
-  }
-
-  private async suggestRefactorings(
-    file: string,
-    content: string
-  ): Promise<RefactoringSuggestion> {
-    logAgentStart('refactoring-suggester', file);
-    const startTime = Date.now();
-
-    const result = await withRetry(async () => {
-      await this.rateLimiter.acquire(5000);
-      try {
-        return await withTimeout(
-          () => this.sendQuery(
-            `You are acting as the refactoring-suggester. Suggest practical refactorings supported by the actual code below.
-
-Return valid JSON matching this schema:
-{
-  "file": "string",
-  "suggestions": [{
-    "type": "extract-function|rename|modernize|simplify|pattern-improvement",
-    "location": "Known function or location",
-    "impact": "low|medium|high",
-    "description": "Current problem",
-    "before": "Existing pattern",
-    "after": "Suggested pattern",
-    "benefits": "Expected benefit"
-  }],
-  "summary": "Evidence-based summary"
-}
-
-Use an empty suggestions array when no meaningful refactoring is warranted. Do not invent source lines or code.
-
-File: ${file}
-
-${content.substring(0, 10000)}`,
-          ),
-          120000,
-          'Refactoring analysis timed out'
-        );
-      } finally {
-        this.rateLimiter.release(5000);
-      }
-    });
-
-    logAgentComplete('refactoring-suggester', file, Date.now() - startTime);
-    return this.parseRefactoringResult(file, result);
-  }
-
-  private parseCodeQualityResult(
-    file: string,
-    response: string
-  ): CodeQualityResult {
-    const parsed = this.extractJson(response);
-
-    return CodeQualityResultSchema.parse({
-      ...(parsed as Record<string, unknown>),
-      file
-    });
-  }
-
-  private parseTestCoverageResult(
-    file: string,
-    response: string
-  ): TestCoverageResult {
-    const parsed = this.extractJson(response);
-
-    return TestCoverageResultSchema.parse({
-      ...(parsed as Record<string, unknown>),
-      file
-    });
-  }
-
-  private parseRefactoringResult(
-    file: string,
-    response: string
-  ): RefactoringSuggestion {
-    const parsed = this.extractJson(response);
-
-    return RefactoringSuggestionSchema.parse({
-      ...(parsed as Record<string, unknown>),
-      file
-    });
-  }
-
-  private generateRecommendations(fileReviews: ReviewReport['fileReviews']): ReviewReport['recommendations'] {
+  private generateRecommendations(
+    fileReviews: ReviewReport['fileReviews']
+  ): ReviewReport['recommendations'] {
     const recommendations: ReviewReport['recommendations'] = [];
 
     const criticalIssues = fileReviews.flatMap((review) =>
@@ -575,7 +528,9 @@ ${content.substring(0, 10000)}`,
 
     const highPriorityTests = fileReviews.flatMap((review) =>
       review.testCoverage.untestedPaths
-        .filter((path) => path.priority === 'critical' || path.priority === 'high')
+        .filter(
+          (path) => path.priority === 'critical' || path.priority === 'high'
+        )
         .map(() => review.file)
     );
 
