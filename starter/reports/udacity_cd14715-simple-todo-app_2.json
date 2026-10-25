@@ -1,0 +1,174 @@
+{
+  "pullRequest": {
+    "owner": "udacity",
+    "repo": "cd14715-simple-todo-app",
+    "number": 2
+  },
+  "fileReviews": [
+    {
+      "file": "src/todo.ts",
+      "codeQuality": {
+        "file": "src/todo.ts",
+        "issues": [
+          {
+            "line": 119,
+            "severity": "critical",
+            "category": "security",
+            "description": "SQL injection vulnerability in searchTodos function. User-supplied keyword is directly interpolated into SQL query using template literal without parameterization or escaping.",
+            "suggestion": "Use parameterized query: `const query = 'SELECT * FROM todos WHERE title LIKE $1 OR description LIKE $2'; const params = [`%${keyword}%`, `%${keyword}%`];` and pass params to db.query()"
+          },
+          {
+            "line": 128,
+            "severity": "critical",
+            "category": "security",
+            "description": "SQL injection vulnerability in searchTodosByStatus function. User-supplied completed parameter is directly concatenated into SQL query without type validation or parameterization.",
+            "suggestion": "Use parameterized query: `const query = 'SELECT * FROM todos WHERE completed = $1'; const params = [completed === 'true' ? true : false];` to enforce type safety and prevent injection"
+          },
+          {
+            "line": 137,
+            "severity": "critical",
+            "category": "security",
+            "description": "SQL injection vulnerability in getTodosByUser function. User-supplied userId is directly interpolated into SQL query using template literal without parameterization.",
+            "suggestion": "Use parameterized query: `const query = 'SELECT t.* FROM todos t JOIN user_todos ut ON t.id = ut.todo_id WHERE ut.user_id = $1'; const params = [userId];` and pass params to db.query()"
+          }
+        ],
+        "overallScore": 35,
+        "summary": "Three critical SQL injection vulnerabilities were introduced in the diff. All three new functions (searchTodos, searchTodosByStatus, getTodosByUser) bypass the secure parameterized query pattern used consistently throughout the rest of the codebase. These vulnerabilities allow attackers to execute arbitrary SQL commands. The existing code demonstrates the correct approach using parameterized queries ($1, $2 placeholders); the new functions must follow the same pattern."
+      },
+      "testCoverage": {
+        "file": "src/todo.ts",
+        "hasTests": false,
+        "testFiles": [],
+        "untestedPaths": [
+          {
+            "type": "function",
+            "location": "searchTodos(keyword: string)",
+            "priority": "critical",
+            "reasoning": "New function with SQL injection vulnerability. Requires tests for both normal search behavior and security regression tests to ensure the vulnerability is fixed before deployment.",
+            "suggestedTest": "Test with malicious SQL injection payloads like `' OR '1'='1`, `'; DROP TABLE todos; --`, and legitimate keywords to verify parameterized queries are used after fix"
+          },
+          {
+            "type": "function",
+            "location": "searchTodosByStatus(completed: string)",
+            "priority": "critical",
+            "reasoning": "New function with SQL injection vulnerability through direct string concatenation. No type coercion or validation of the completed parameter.",
+            "suggestedTest": "Test with boolean values, SQL injection attempts like `1 OR 1=1`, and verify parameterized query implementation after fix"
+          },
+          {
+            "type": "function",
+            "location": "getTodosByUser(userId: string)",
+            "priority": "critical",
+            "reasoning": "New function with SQL injection vulnerability in JOIN query. Requires tests to verify the join logic works correctly and that parameterized queries prevent injection attacks.",
+            "suggestedTest": "Test with valid user IDs, SQL injection payloads like `'; DELETE FROM user_todos; --`, and verify correct todos are returned for a given user"
+          },
+          {
+            "type": "edge-case",
+            "location": "searchTodos(keyword: string)",
+            "priority": "high",
+            "reasoning": "Empty string, null, and special SQL characters (%, _) in keywords need to be tested for correct LIKE behavior and injection prevention",
+            "suggestedTest": "Test with empty string, special regex/SQL characters (%, _, \\), and very long strings"
+          },
+          {
+            "type": "edge-case",
+            "location": "searchTodosByStatus(completed: string)",
+            "priority": "high",
+            "reasoning": "Parameter expects boolean values but receives string. Type coercion edge cases need testing (empty string, 'true', 'false', null, undefined)",
+            "suggestedTest": "Test with various string representations: '', 'true', 'false', '0', '1', 'null', and non-boolean values"
+          },
+          {
+            "type": "edge-case",
+            "location": "getTodosByUser(userId: string)",
+            "priority": "high",
+            "reasoning": "Should handle users with no todos, non-existent user IDs, and empty result sets",
+            "suggestedTest": "Test with valid user having multiple todos, user with no todos, non-existent userId, and empty string userId"
+          },
+          {
+            "type": "branch",
+            "location": "searchTodos(keyword: string)",
+            "priority": "high",
+            "reasoning": "Query has OR condition - both title and description matching branches need coverage to ensure search works correctly",
+            "suggestedTest": "Test matches only in title, matches only in description, and matches in both fields"
+          }
+        ],
+        "coverageEstimate": 0,
+        "summary": "No test files were identified in the provided code. Coverage is not measured. The diff adds three new database query functions (searchTodos, searchTodosByStatus, getTodosByUser) that contain documented SQL injection vulnerabilities and require comprehensive testing. All three functions are marked as critical priority because they lack parameterized queries and input validation. No existing tests were provided to evaluate coverage of the new code paths. Testing should focus on both functional correctness and security regression testing for SQL injection payloads before these functions are used in production."
+      },
+      "refactorings": {
+        "file": "src/todo.ts",
+        "suggestions": [
+          {
+            "type": "pattern-improvement",
+            "location": "searchTodos()",
+            "impact": "high",
+            "description": "SQL injection vulnerability via unparameterized template literal with user-supplied keyword",
+            "before": "const query = `SELECT * FROM todos WHERE title LIKE '%${keyword}%' OR description LIKE '%${keyword}%'`;\nconst rows = await db.query(query);",
+            "after": "const query = 'SELECT * FROM todos WHERE title LIKE $1 OR description LIKE $2';\nconst rows = await db.query(query, [`%${keyword}%`, `%${keyword}%`]);",
+            "benefits": "Eliminates SQL injection risk by using parameterized queries, consistent with existing patterns in createTodo(), getTodoById(), updateTodoStatus(), and deleteTodo()"
+          },
+          {
+            "type": "pattern-improvement",
+            "location": "searchTodosByStatus()",
+            "impact": "high",
+            "description": "SQL injection vulnerability via string concatenation with unvalidated completed parameter",
+            "before": "const sql = \"SELECT * FROM todos WHERE completed = \" + completed;\nconst rows = await db.query(sql);",
+            "after": "const query = 'SELECT * FROM todos WHERE completed = $1';\nconst rows = await db.query(query, [completed === 'true' || completed === '1']);",
+            "benefits": "Prevents SQL injection and adds type coercion to convert string input to boolean, matching updateTodoStatus() security pattern"
+          },
+          {
+            "type": "pattern-improvement",
+            "location": "getTodosByUser()",
+            "impact": "high",
+            "description": "SQL injection vulnerability via unparameterized template literal with user-supplied userId",
+            "before": "const query = `SELECT t.* FROM todos t JOIN user_todos ut ON t.id = ut.todo_id WHERE ut.user_id = '${userId}'`;\nconst rows = await db.query(query);",
+            "after": "const query = 'SELECT t.* FROM todos t JOIN user_todos ut ON t.id = ut.todo_id WHERE ut.user_id = $1';\nconst rows = await db.query(query, [userId]);",
+            "benefits": "Eliminates SQL injection by using parameterized queries, aligns with secure patterns established elsewhere in codebase"
+          }
+        ],
+        "summary": "Three critical SQL injection vulnerabilities introduced in the patch. The existing codebase (createTodo, getTodoById, updateTodoStatus, deleteTodo) demonstrates correct use of parameterized queries with db.query(query, params). The three new functions regress to unsafe string interpolation/concatenation patterns. All three require immediate refactoring to use parameterized queries with the same $1, $2 placeholder syntax used throughout the rest of the file."
+      }
+    }
+  ],
+  "summary": {
+    "totalFiles": 1,
+    "overallScore": 35,
+    "criticalIssues": 3,
+    "highPriorityTests": 7,
+    "refactoringOpportunities": 3
+  },
+  "recommendations": [
+    {
+      "priority": "critical",
+      "category": "Critical Issues",
+      "description": "Review and address 3 critical issue(s).",
+      "files": [
+        "src/todo.ts"
+      ]
+    },
+    {
+      "priority": "high",
+      "category": "Test Coverage",
+      "description": "Add tests for 7 high-priority untested path(s).",
+      "files": [
+        "src/todo.ts"
+      ]
+    },
+    {
+      "priority": "medium",
+      "category": "Refactoring",
+      "description": "Evaluate 3 high-impact refactoring suggestion(s).",
+      "files": [
+        "src/todo.ts"
+      ]
+    }
+  ],
+  "metadata": {
+    "analyzedAt": "2026-10-25T12:34:52.772Z",
+    "duration": 18303,
+    "agentVersions": {
+      "orchestrator": "1.1.0",
+      "codeQuality": "1.1.0",
+      "testCoverage": "1.1.0",
+      "refactoring": "1.1.0"
+    }
+  }
+}

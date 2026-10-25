@@ -11,6 +11,8 @@
  * - ESLint MCP: https://eslint.org/docs/latest/use/mcp
  */
 
+// Use a getter to ensure environment variables are evaluated at runtime
+// after dotenv.config() has been called
 export const mcpServersConfig = {
   /**
    * GitHub MCP Server
@@ -20,21 +22,25 @@ export const mcpServersConfig = {
    * The GitHub MCP server expects GITHUB_PERSONAL_ACCESS_TOKEN as the env var name.
    * We map our GITHUB_TOKEN from .env to this expected name.
    */
-  github: {
-    type: 'stdio' as const,
-    command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-github'],
-    env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN || '' }
+  get github() {
+    return {
+      type: 'stdio' as const,
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-github'],
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN || '' }
+    };
   },
 
   /**
    * ESLint MCP Server
    * Provides tools for linting and code quality analysis
    */
-  eslint: {
-    type: 'stdio' as const,
-    command: 'npx',
-    args: ['-y', '@eslint/mcp@latest'],
-    env: {}
+  get eslint() {
+    return {
+      type: 'stdio' as const,
+      command: 'npx',
+      args: ['-y', '@eslint/mcp@latest'],
+      env: {}
+    };
   }
 };

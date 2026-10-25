@@ -89,8 +89,8 @@ async function main() {
     }
 
     // Generate and save reports
-    const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
-    const baseFilename = `${owner}-${repo}-${prNumber}-${timestamp}`;
+    // Use underscore format without timestamp as required for submission
+    const baseFilename = `${owner}_${repo}_${prNumber}`;
 
     // Markdown report
     const markdownReport = generator.generateMarkdownReport(report);
